@@ -2,8 +2,9 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,6 +37,20 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Resolve release version
+        id: release_version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 --manifest-path src-tauri/Cargo.toml | node -e "const fs = require('fs'); const metadata = JSON.parse(fs.readFileSync(0, 'utf8')); console.log(metadata.packages[0].version)")"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Release tag ${tag} already exists. Bump src-tauri/Cargo.toml version before releasing again."
+            exit 1
+          fi
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -50,7 +65,7 @@ jobs:
       - name: Prepare release notes
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${{ steps.release_version.outputs.version }}"
 
           awk -v version="$version" '
             BEGIN { capture = 0; found = 0 }
@@ -78,5 +93,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body_path: RELEASE_NOTES.md
           files: src-tauri/target/release/bundle/appimage/*.AppImage
