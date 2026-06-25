@@ -38,6 +38,19 @@ type InstallResponse = {
   steps: InstallStep[];
 };
 
+type InstalledApp = {
+  appName: string;
+  installRoot: string;
+  executablePath: string | null;
+  desktopEntryPath: string | null;
+  pathLink: string | null;
+};
+
+type UninstallResponse = {
+  appName: string;
+  steps: InstallStep[];
+};
+
 type ExecutableCandidate = {
   path: string;
   relativePath: string;
@@ -83,6 +96,18 @@ type PreviewState =
   | { status: "idle" }
   | { status: "running" }
   | { status: "success"; response: PreviewResponse }
+  | { status: "error"; message: string };
+
+type InstalledAppsState =
+  | { status: "idle" }
+  | { status: "running" }
+  | { status: "success"; apps: InstalledApp[] }
+  | { status: "error"; message: string };
+
+type UninstallState =
+  | { status: "idle" }
+  | { status: "running" }
+  | { status: "success"; response: UninstallResponse }
   | { status: "error"; message: string };
 
 function detectPackageKind(fileName: string): PackageKind {
@@ -137,6 +162,11 @@ function App() {
   const [previewState, setPreviewState] = useState<PreviewState>({ status: "idle" });
   const [selectedExecutablePath, setSelectedExecutablePath] = useState("");
   const [installState, setInstallState] = useState<InstallState>({ status: "idle" });
+  const [installedAppsState, setInstalledAppsState] = useState<InstalledAppsState>({
+    status: "idle",
+  });
+  const [selectedUninstallAppName, setSelectedUninstallAppName] = useState("");
+  const [uninstallState, setUninstallState] = useState<UninstallState>({ status: "idle" });
 
   const installPlan = useMemo(() => {
     if (!installTarget) {
@@ -172,6 +202,11 @@ function App() {
 
   const canInstall =
     Boolean(installTarget && selectedExecutable) && installState.status !== "running";
+  const installedApps = installedAppsState.status === "success" ? installedAppsState.apps : [];
+  const selectedUninstallApp =
+    installedApps.find((app) => app.appName === selectedUninstallAppName) ?? null;
+  const selectedUninstallOptionValue = selectedUninstallApp?.appName ?? "";
+  const canUninstall = Boolean(selectedUninstallApp) && uninstallState.status !== "running";
 
   useEffect(() => {
     if (!installTarget) {
@@ -230,6 +265,68 @@ function App() {
       isCurrent = false;
     };
   }, [installTarget]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadInstalledApps() {
+      setInstalledAppsState({ status: "running" });
+
+      try {
+        const apps = await invoke<InstalledApp[]>("list_installed_apps", {
+          request: {
+            installDir: installPath,
+          },
+        });
+
+        if (!isCurrent) {
+          return;
+        }
+
+        setInstalledAppsState({ status: "success", apps });
+        setSelectedUninstallAppName((current) =>
+          apps.some((app) => app.appName === current) ? current : apps[0]?.appName ?? "",
+        );
+      } catch (error) {
+        if (!isCurrent) {
+          return;
+        }
+
+        setInstalledAppsState({
+          status: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        setSelectedUninstallAppName("");
+      }
+    }
+
+    loadInstalledApps();
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [installPath]);
+
+  async function refreshInstalledApps() {
+    try {
+      const apps = await invoke<InstalledApp[]>("list_installed_apps", {
+        request: {
+          installDir: installPath,
+        },
+      });
+
+      setInstalledAppsState({ status: "success", apps });
+      setSelectedUninstallAppName((current) =>
+        apps.some((app) => app.appName === current) ? current : apps[0]?.appName ?? "",
+      );
+    } catch (error) {
+      setInstalledAppsState({
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      setSelectedUninstallAppName("");
+    }
+  }
 
   async function handlePickFile() {
     try {
@@ -291,8 +388,39 @@ function App() {
       });
 
       setInstallState({ status: "success", response });
+      await refreshInstalledApps();
     } catch (error) {
       setInstallState({
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function handleUninstall() {
+    if (!selectedUninstallApp || uninstallState.status === "running") {
+      return;
+    }
+
+    const confirmed = window.confirm(`确认卸载 ${selectedUninstallApp.appName}？`);
+    if (!confirmed) {
+      return;
+    }
+
+    setUninstallState({ status: "running" });
+
+    try {
+      const response = await invoke<UninstallResponse>("uninstall_app", {
+        request: {
+          installDir: installPath,
+          appName: selectedUninstallApp.appName,
+        },
+      });
+
+      setUninstallState({ status: "success", response });
+      await refreshInstalledApps();
+    } catch (error) {
+      setUninstallState({
         status: "error",
         message: error instanceof Error ? error.message : String(error),
       });
@@ -575,6 +703,89 @@ function App() {
               )}
             </section>
           )}
+
+          <section className="uninstall-panel">
+            <div className="section-heading">
+              <span>05</span>
+              <h2>卸载应用</h2>
+            </div>
+
+            <div className="uninstall-layout">
+              <label className="field">
+                <span>已安装应用</span>
+                <select
+                  disabled={installedAppsState.status !== "success" || installedApps.length === 0}
+                  onChange={(event) => {
+                    setSelectedUninstallAppName(event.currentTarget.value);
+                    setUninstallState({ status: "idle" });
+                  }}
+                  value={selectedUninstallOptionValue}
+                >
+                  {installedApps.length === 0 && <option value="">未检测到应用</option>}
+                  {installedApps.map((app) => (
+                    <option key={app.installRoot} value={app.appName}>
+                      {app.appName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div>
+                <span className="summary-label">安装位置</span>
+                <strong>{selectedUninstallApp?.installRoot ?? "-"}</strong>
+              </div>
+
+              <button disabled={!canUninstall} onClick={handleUninstall} type="button">
+                {uninstallState.status === "running" ? "卸载中" : "卸载"}
+              </button>
+            </div>
+
+            {installedAppsState.status === "running" && (
+              <p className="result-message">正在读取已安装应用...</p>
+            )}
+
+            {installedAppsState.status === "error" && (
+              <p className="result-message">{installedAppsState.message}</p>
+            )}
+
+            {selectedUninstallApp && (
+              <div className="uninstall-details">
+                <div>
+                  <span className="summary-label">入口</span>
+                  <strong>{selectedUninstallApp.executablePath ?? "-"}</strong>
+                </div>
+                <div>
+                  <span className="summary-label">桌面入口</span>
+                  <strong>{selectedUninstallApp.desktopEntryPath ?? "-"}</strong>
+                </div>
+                <div>
+                  <span className="summary-label">PATH 链接</span>
+                  <strong>{selectedUninstallApp.pathLink ?? "-"}</strong>
+                </div>
+              </div>
+            )}
+
+            {uninstallState.status === "error" && (
+              <p className="result-message result-message-error">{uninstallState.message}</p>
+            )}
+
+            {uninstallState.status === "success" && (
+              <div className="step-log">
+                {uninstallState.response.steps.map((step) => (
+                  <div
+                    className={`step-row step-${step.status}`}
+                    key={`${step.title}-${step.detail}`}
+                  >
+                    <span>{step.status === "done" ? "完成" : "跳过"}</span>
+                    <div>
+                      <strong>{step.title}</strong>
+                      <p>{step.detail}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </section>
       </section>
     </main>

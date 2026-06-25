@@ -66,24 +66,6 @@ src-tauri/target/release/bundle/appimage/
 
 ## 发布
 
-仓库包含 GitHub Actions 工作流：`.github/workflows/release.yml`。
-
-推送形如 `v0.1.0` 的 tag 后，工作流会：
-
-1. 安装 Linux 构建依赖。
-2. 安装 Bun 与 Rust stable。
-3. 安装前端依赖。
-4. 构建 Linux AppImage。
-5. 从 `CHANGELOG.md` 中提取对应版本内容作为 GitHub Release 描述。
-6. 上传 AppImage 到 GitHub Release。
-
-发布示例：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
 发布前请确保 `CHANGELOG.md` 中存在对应版本章节，例如：
 
 ```markdown
