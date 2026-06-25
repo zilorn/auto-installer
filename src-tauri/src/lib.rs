@@ -54,6 +54,36 @@ struct InstallResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct InstalledAppsRequest {
+    install_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UninstallRequest {
+    install_dir: String,
+    app_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledApp {
+    app_name: String,
+    install_root: String,
+    executable_path: Option<String>,
+    desktop_entry_path: Option<String>,
+    path_link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UninstallResponse {
+    app_name: String,
+    steps: Vec<InstallStep>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewRequest {
     source_path: String,
     package_kind: PackageKind,
@@ -300,6 +330,109 @@ fn install_package(request: InstallRequest) -> Result<InstallResponse, String> {
         path_link,
         steps,
     })
+}
+
+#[tauri::command]
+fn list_installed_apps(request: InstalledAppsRequest) -> Result<Vec<InstalledApp>, String> {
+    let install_dir = validate_install_dir(&request.install_dir)?;
+
+    if !install_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut apps = Vec::new();
+    for entry in
+        fs::read_dir(&install_dir).map_err(|error| format!("读取安装目录失败：{}", error))?
+    {
+        let entry = entry.map_err(|error| format!("读取安装目录项失败：{}", error))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("读取安装目录项信息失败：{}", error))?;
+
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let app_name = entry.file_name().to_string_lossy().to_string();
+        let install_root = entry.path();
+        apps.push(InstalledApp {
+            app_name,
+            install_root: install_root.display().to_string(),
+            executable_path: find_executables(&install_root)
+                .first()
+                .map(|path| path.display().to_string()),
+            desktop_entry_path: find_desktop_entry_for_install_root(&install_root)
+                .map(|path| path.display().to_string()),
+            path_link: find_path_link_for_install_root(&install_root)
+                .map(|path| path.display().to_string()),
+        });
+    }
+
+    apps.sort_by(|left, right| left.app_name.cmp(&right.app_name));
+    Ok(apps)
+}
+
+#[tauri::command]
+fn uninstall_app(request: UninstallRequest) -> Result<UninstallResponse, String> {
+    let install_dir = validate_install_dir(&request.install_dir)?;
+    let app_name = sanitize_file_stem(request.app_name.trim());
+    let install_root = install_dir.join(&app_name);
+    let canonical_install_dir = install_dir
+        .canonicalize()
+        .map_err(|error| format!("读取安装目录失败：{}", error))?;
+    let canonical_install_root = install_root
+        .canonicalize()
+        .map_err(|_| "该应用不在当前安装目录中".to_string())?;
+
+    if !canonical_install_root.starts_with(&canonical_install_dir) {
+        return Err("应用目录不在当前安装目录中，已停止卸载".into());
+    }
+
+    let mut steps = Vec::new();
+
+    if let Some(desktop_entry_path) = find_desktop_entry_for_install_root(&canonical_install_root) {
+        fs::remove_file(&desktop_entry_path)
+            .map_err(|error| format!("删除桌面入口失败：{}", error))?;
+        steps.push(done_step(
+            "桌面入口",
+            format!("已删除 {}", desktop_entry_path.display()),
+        ));
+    } else {
+        steps.push(skipped_step("桌面入口", "未找到指向该应用的 .desktop 文件"));
+    }
+
+    if let Some(path_link) = find_path_link_for_install_root(&canonical_install_root) {
+        fs::remove_file(&path_link).map_err(|error| format!("删除 PATH 链接失败：{}", error))?;
+        steps.push(done_step(
+            "PATH 链接",
+            format!("已删除 {}", path_link.display()),
+        ));
+    } else {
+        steps.push(skipped_step("PATH 链接", "未找到指向该应用的命令行链接"));
+    }
+
+    fs::remove_dir_all(&canonical_install_root)
+        .map_err(|error| format!("删除应用目录失败：{}", error))?;
+    steps.push(done_step(
+        "应用文件",
+        format!("已删除 {}", canonical_install_root.display()),
+    ));
+
+    Ok(UninstallResponse { app_name, steps })
+}
+
+fn validate_install_dir(value: &str) -> Result<PathBuf, String> {
+    let install_dir = expand_home(value.trim())?;
+
+    if install_dir.as_os_str().is_empty() {
+        return Err("安装目录不能为空".into());
+    }
+
+    if !install_dir.is_absolute() {
+        return Err("安装目录必须是绝对路径，或使用 ~/ 开头的路径".into());
+    }
+
+    Ok(install_dir)
 }
 
 fn validate_source(source_path: &Path, package_kind: PackageKind) -> Result<(), String> {
@@ -816,6 +949,77 @@ fn link_to_local_bin(
     Ok(link_path.display().to_string())
 }
 
+fn find_desktop_entry_for_install_root(install_root: &Path) -> Option<PathBuf> {
+    let desktop_dir = home_dir().ok()?.join(".local/share/applications");
+    let entries = fs::read_dir(desktop_dir).ok()?;
+    let install_root = install_root
+        .canonicalize()
+        .unwrap_or_else(|_| install_root.to_path_buf());
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("desktop") {
+            continue;
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Exec="))
+            .any(|value| desktop_exec_references_root(value, &install_root))
+        {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn desktop_exec_references_root(value: &str, install_root: &Path) -> bool {
+    let install_root = install_root.display().to_string();
+    let cleaned = value.replace("\\\"", "\"");
+    cleaned.contains(&install_root)
+}
+
+fn find_path_link_for_install_root(install_root: &Path) -> Option<PathBuf> {
+    let bin_dir = home_dir().ok()?.join(".local/bin");
+    let entries = fs::read_dir(bin_dir).ok()?;
+    let install_root = install_root
+        .canonicalize()
+        .unwrap_or_else(|_| install_root.to_path_buf());
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let Ok(target) = fs::read_link(&path) else {
+            continue;
+        };
+        let resolved_target = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new("")).join(target)
+        };
+        let canonical_target = resolved_target
+            .canonicalize()
+            .unwrap_or_else(|_| resolved_target.clone());
+
+        if canonical_target.starts_with(&install_root) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn find_executables(root: &Path) -> Vec<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     let mut candidates = Vec::new();
@@ -1173,7 +1377,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             inspect_source_file,
             preview_package,
-            install_package
+            install_package,
+            list_installed_apps,
+            uninstall_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
